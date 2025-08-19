@@ -388,30 +388,32 @@ class RayPPOTrainer:
         config = self.config
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
-        if config.actor_rollout_ref.actor.strategy == "megatron":
-            model_parallel_size = (
-                config.actor_rollout_ref.actor.megatron.tensor_model_parallel_size
-                * config.actor_rollout_ref.actor.megatron.pipeline_model_parallel_size
-            )
-            assert (
-                n_gpus % (model_parallel_size * config.actor_rollout_ref.actor.megatron.context_parallel_size) == 0
-            ), (
-                f"n_gpus ({n_gpus}) must be divisible by model_parallel_size ({model_parallel_size}) times "
-                f"context_parallel_size ({config.actor_rollout_ref.actor.megatron.context_parallel_size})"
-            )
-            megatron_dp = n_gpus // (
-                model_parallel_size * config.actor_rollout_ref.actor.megatron.context_parallel_size
-            )
-            minimal_bsz = megatron_dp * config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
-        else:
-            minimal_bsz = n_gpus
 
-        # 1. Check total batch size for data correctness
-        real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
-        assert real_train_batch_size % minimal_bsz == 0, (
-            f"real_train_batch_size ({real_train_batch_size}) must be divisible by minimal possible batch size "
-            f"({minimal_bsz})"
-        )
+        if not config.actor_rollout_ref.actor.use_dynamic_bsz:
+            if config.actor_rollout_ref.actor.strategy == "megatron":
+                model_parallel_size = (
+                    config.actor_rollout_ref.actor.megatron.tensor_model_parallel_size
+                    * config.actor_rollout_ref.actor.megatron.pipeline_model_parallel_size
+                )
+                assert (
+                    n_gpus % (model_parallel_size * config.actor_rollout_ref.actor.megatron.context_parallel_size) == 0
+                ), (
+                    f"n_gpus ({n_gpus}) must be divisible by model_parallel_size ({model_parallel_size}) times "
+                    f"context_parallel_size ({config.actor_rollout_ref.actor.megatron.context_parallel_size})"
+                )
+                megatron_dp = n_gpus // (
+                    model_parallel_size * config.actor_rollout_ref.actor.megatron.context_parallel_size
+                )
+                minimal_bsz = megatron_dp * config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
+            else:
+                minimal_bsz = n_gpus
+
+            # 1. Check total batch size for data correctness
+            real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
+            assert real_train_batch_size % minimal_bsz == 0, (
+                f"real_train_batch_size ({real_train_batch_size}) must be divisible by minimal possible batch size "
+                f"({minimal_bsz})"
+            )
 
         # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
         # We throw an error if the user sets both. The new convention is "..._micro_batch_size_per_gpu".
@@ -625,6 +627,23 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
+    def _get_gen_batch(self, batch: DataProto) -> DataProto:
+        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+
+        # pop those keys for generation
+        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
+        gen_batch = batch.pop(
+            batch_keys=batch_keys_to_pop,
+            non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
+        )
+
+        # For agent loop, we need reward model keys to compute score.
+        if self.async_rollout_mode:
+            gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
+
+        return gen_batch
+
     def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -659,23 +678,7 @@ class RayPPOTrainer:
             ]
             sample_gts.extend(ground_truths)
 
-            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-            non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-            if "multi_modal_data" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("multi_modal_data")
-            if "raw_prompt" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("raw_prompt")
-            if "tools_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("tools_kwargs")
-            if "interaction_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("interaction_kwargs")
-            if "agent_name" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("agent_name")
-            test_gen_batch = test_batch.pop(
-                batch_keys=batch_keys_to_pop,
-                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-            )
-
+            test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
@@ -1107,26 +1110,7 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
-                # pop those keys for generation
-                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-                if "multi_modal_data" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("multi_modal_data")
-                if "raw_prompt" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("raw_prompt")
-                if "tools_kwargs" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("tools_kwargs")
-                if "interaction_kwargs" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("interaction_kwargs")
-                if "index" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("index")
-                if "agent_name" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("agent_name")
-
-                gen_batch = batch.pop(
-                    batch_keys=batch_keys_to_pop,
-                    non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-                )
+                gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
